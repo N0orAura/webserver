@@ -16,7 +16,7 @@ func main() {
 
 var users = map[string]string{}
 var userPasswords = map[string][]map[string]string{}
-var savepasswords = map[string][]map[string]string{}
+var AddPasswords = map[string][]map[string]string{}
 
 func SignUp(
 	w http.ResponseWriter,
