@@ -1,0 +1,30 @@
+meta {
+  name: Login
+  type: http
+  seq: 2
+}
+
+post {
+  url: http://localhost:8080/log_in
+  body: json
+  auth: inherit
+}
+
+body:json {
+  {
+    "username": "noor25",
+    "password": "StrongPassword@123"
+  }
+  
+}
+
+tests {
+  const data = res.body;
+  bru.setEnvVar("TOKEN", data.token);
+  
+}
+
+settings {
+  encodeUrl: true
+  timeout: 0
+}
