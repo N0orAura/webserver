@@ -1,7 +1,7 @@
 meta {
   name: Signup
   type: http
-  seq: 1
+  seq: 2
 }
 
 post {
@@ -10,10 +10,14 @@ post {
   auth: inherit
 }
 
+headers {
+  Content-Type: application/json
+}
+
 body:json {
   {
-    "username": "noor25",
-    "password": "StrongPassword@123"
+    "username": "GMU123",
+    "password": "12345A$678901112"
   }
   
 }

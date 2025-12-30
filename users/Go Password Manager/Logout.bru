@@ -1,0 +1,20 @@
+meta {
+  name: Logout
+  type: http
+  seq: 7
+}
+
+post {
+  url: http://localhost:8080/log_out
+  body: none
+  auth: inherit
+}
+
+headers {
+  Authorization: {{TOKEN}}
+}
+
+settings {
+  encodeUrl: true
+  timeout: 0
+}

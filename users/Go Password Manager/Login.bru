@@ -1,7 +1,7 @@
 meta {
   name: Login
   type: http
-  seq: 2
+  seq: 3
 }
 
 post {
@@ -10,12 +10,15 @@ post {
   auth: inherit
 }
 
+headers {
+  Content-Type: application/json
+}
+
 body:json {
   {
-    "username": "noor25",
-    "password": "StrongPassword@123"
+    "username": "GMU123",
+    "password": "12345A$678901112"
   }
-  
 }
 
 tests {
