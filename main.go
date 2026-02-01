@@ -1,39 +1,88 @@
 package main
 
 import (
+	"crypto/aes"
+	"crypto/cipher"
 	"crypto/rand"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"io"
 	"net/http"
+	"os"
 	"strings"
 	"time"
 
+	"github.com/joho/godotenv"
 	"golang.org/x/crypto/bcrypt"
 )
 
-func Encrypt(text string) string {
-	key := byte(7)
-	result := []byte(text)
-
-	for i := 0; i < len(result); i++ {
-		result[i] = result[i] ^ key
+func EncryptAES(plainText string, key []byte) (string, error) {
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return "", err
 	}
 
-	return string(result)
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return "", err
+	}
+
+	nonce := make([]byte, gcm.NonceSize())
+	if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
+		return "", err
+	}
+
+	cipherText := gcm.Seal(nonce, nonce, []byte(plainText), nil)
+	return base64.StdEncoding.EncodeToString(cipherText), nil
 }
 
-func Decrypt(text string) string {
-	key := byte(7)
-	result := []byte(text)
-
-	for i := 0; i < len(result); i++ {
-		result[i] = result[i] ^ key
+func DecryptAES(cipherText string, key []byte) (string, error) {
+	data, err := base64.StdEncoding.DecodeString(cipherText)
+	if err != nil {
+		return "", err
 	}
 
-	return string(result)
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return "", err
+	}
+
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return "", err
+	}
+
+	nonceSize := gcm.NonceSize()
+	nonce, cipherData := data[:nonceSize], data[nonceSize:]
+
+	plainText, err := gcm.Open(nil, nonce, cipherData, nil)
+	if err != nil {
+		return "", err
+	}
+
+	return string(plainText), nil
+}
+
+func loadEncryptionKey() []byte {
+	key := os.Getenv("ENCRYPTION_KEY")
+
+	if key == "" {
+		panic("ENCRYPTION_KEY is missing")
+	}
+
+	if len(key) != 32 {
+		panic("ENCRYPTION_KEY must be 32 bytes long")
+	}
+	return []byte(key)
 }
 
 func main() {
+
+	err := godotenv.Load(".env")
+	if err != nil {
+		panic("Error loading .env file")
+	}
 
 	http.HandleFunc("/sign_up", SignUp)
 	http.HandleFunc("/log_in", Login)
@@ -99,6 +148,21 @@ func generateToken() string {
 	b := make([]byte, 32)
 	rand.Read(b)
 	return hex.EncodeToString(b)
+}
+
+func generatPassword(length int) (string, error) {
+	const charset = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789!@#$%^&*()_+-"
+	b := make([]byte, length)
+	_, err := rand.Read(b)
+	if err != nil {
+		return "", err
+	}
+
+	for i := 0; i < length; i++ {
+		b[i] = charset[int(b[i])%len(charset)]
+	}
+
+	return string(b), nil
 }
 
 func SignUp(
@@ -333,11 +397,15 @@ func AddPassword(
 	password := body.Password
 
 	if password == "" {
-		w.WriteHeader(http.StatusBadRequest)
-		json.NewEncoder(w).Encode(ErrorResponse{
-			Error: "Password cannot be empty",
-		})
-		return
+		var err error
+		password, err = generatPassword(16)
+		if err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(ErrorResponse{
+				Error: "Password generation failed",
+			})
+			return
+		}
 	}
 
 	if len(password) < 12 {
@@ -405,7 +473,15 @@ func AddPassword(
 		return
 	}
 
-	encryptedPassword := Encrypt(body.Password)
+	key := loadEncryptionKey()
+	encryptedPassword, err := EncryptAES(password, key)
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(ErrorResponse{
+			Error: "Encryption failed",
+		})
+		return
+	}
 
 	pass := PasswordInfo{
 		Name:     body.Name,
@@ -458,7 +534,13 @@ func ListPasswords(
 
 	for _, pass := range passwords {
 		passCopy := pass
-		passCopy.Password = Decrypt(pass.Password)
+		key := loadEncryptionKey()
+		decrypted, err := DecryptAES(pass.Password, key)
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		passCopy.Password = decrypted
 		response = append(response, passCopy)
 	}
 
@@ -494,7 +576,13 @@ func GetPassword(
 	for _, pass := range user.Passwords {
 		if pass.Name == name {
 			passCopy := pass
-			passCopy.Password = Decrypt(pass.Password)
+			key := loadEncryptionKey()
+			decrypted, err := DecryptAES(pass.Password, key)
+			if err != nil {
+				w.WriteHeader(http.StatusInternalServerError)
+				return
+			}
+			passCopy.Password = decrypted
 			w.WriteHeader(http.StatusOK)
 			json.NewEncoder(w).Encode(passCopy)
 			return
@@ -537,7 +625,13 @@ func SearchPasswords(
 	for _, pass := range user.Passwords {
 		if strings.Contains(pass.Name, query) {
 			passCopy := pass
-			passCopy.Password = Decrypt(pass.Password)
+			key := loadEncryptionKey()
+			decrypted, err := DecryptAES(pass.Password, key)
+			if err != nil {
+				w.WriteHeader(http.StatusInternalServerError)
+				return
+			}
+			passCopy.Password = decrypted
 			results = append(results, passCopy)
 		}
 	}
