@@ -121,6 +121,13 @@ type TokenInfo struct {
 	Expiry   time.Time
 }
 
+type LoginAttempt struct {
+	Count     int
+	BlockedAt time.Time
+}
+
+var LoginAttempts = map[string]LoginAttempt{}
+
 var tokens = map[string]TokenInfo{}
 
 type SignUpRequest struct {
@@ -313,8 +320,25 @@ func Login(
 	username := body.Username
 	password := body.Password
 
+	attempt, exists := LoginAttempts[username]
+	if exists && attempt.Count >= 5 {
+		if time.Since(attempt.BlockedAt) < 15*time.Minute {
+			w.WriteHeader(http.StatusTooManyRequests)
+			json.NewEncoder(w).Encode(ErrorResponse{
+				Error: "Too many failed login attempts. PLease try again after 15 minute",
+			})
+			return
+		}
+		delete(LoginAttempts, username)
+	}
+
 	user, ok := users[username]
 	if !ok {
+		attempt.Count++
+		if attempt.Count >= 5 {
+			attempt.BlockedAt = time.Now()
+		}
+		LoginAttempts[username] = attempt
 		w.WriteHeader(http.StatusUnauthorized)
 		json.NewEncoder(w).Encode(MessageResponse{
 			Message: "Invalid Username or Password",
@@ -327,12 +351,19 @@ func Login(
 		[]byte(password),
 	)
 	if err != nil {
+		attempt.Count++
+		if attempt.Count >= 5 {
+			attempt.BlockedAt = time.Now()
+		}
+		LoginAttempts[username] = attempt
 		w.WriteHeader(http.StatusUnauthorized)
 		json.NewEncoder(w).Encode(MessageResponse{
 			Message: "Invalid Username or Password",
 		})
 		return
 	}
+
+	delete(LoginAttempts, username)
 
 	token := generateToken()
 	tokens[token] = TokenInfo{
