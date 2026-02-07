@@ -92,6 +92,9 @@ func main() {
 	http.HandleFunc("/get_password", GetPassword)
 	http.HandleFunc("/search_passwords", SearchPasswords)
 	http.HandleFunc("/delete_password", DeletePassword)
+	http.HandleFunc("/create_group", CreateGroup)
+	http.HandleFunc("/share_password", SharePassword)
+	http.HandleFunc("/list_shared_passwords", ListSharedPasswords)
 	http.ListenAndServe(":8080", nil)
 }
 
@@ -151,6 +154,36 @@ type StoredPassword struct {
 	Password string `json:"password"`
 }
 
+type CreateGroupRequest struct {
+	Name    string   `json:"name"`
+	Members []string `json:"members"`
+}
+
+type Group struct {
+	ID      string   `json:"id"`
+	Name    string   `json:"name"`
+	Owner   string   `json:"owner"`
+	Members []string `json:"members"`
+}
+
+type SharedPassword struct {
+	Name     string   `json:"name"`
+	Password string   `json:"password"`
+	Owner    string   `json:"owner"`
+	GroupID  string   `json:"group_id"`
+	Members  []string `json:"members"`
+}
+
+var Groups = map[string]Group{}
+var SharedPasswords = map[string]SharedPassword{}
+
+type SharePasswordRequest struct {
+	GroupID  string `json:"group_id"`
+	Name     string `json:"name"`
+	Username string `json:"username"`
+	Password string `json:"password"`
+}
+
 func generateToken() string {
 	b := make([]byte, 32)
 	rand.Read(b)
@@ -170,6 +203,12 @@ func generatPassword(length int) (string, error) {
 	}
 
 	return string(b), nil
+}
+
+func generateGroupID() string {
+	b := make([]byte, 16)
+	rand.Read(b)
+	return hex.EncodeToString(b)
 }
 
 func SignUp(
@@ -615,7 +654,9 @@ func GetPassword(
 			}
 			passCopy.Password = decrypted
 			w.WriteHeader(http.StatusOK)
-			json.NewEncoder(w).Encode(passCopy)
+			encoder := json.NewEncoder(w)
+			encoder.SetIndent("", " ")
+			encoder.Encode(passCopy)
 			return
 		}
 	}
@@ -718,4 +759,213 @@ func DeletePassword(
 	json.NewEncoder(w).Encode(ErrorResponse{
 		Error: "Password not found",
 	})
+}
+
+func CreateGroup(
+	w http.ResponseWriter,
+	r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+
+	token := r.Header.Get("Authorization")
+	TokenInfo, ok := tokens[token]
+	if !ok || time.Now().After(TokenInfo.Expiry) {
+		delete(tokens, token)
+		w.WriteHeader(http.StatusUnauthorized)
+		json.NewEncoder(w).Encode(ErrorResponse{
+			Error: "Invalid or expired token",
+		})
+		return
+	}
+
+	username := TokenInfo.Username
+
+	var body CreateGroupRequest
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(ErrorResponse{
+			Error: "Invalid input",
+		})
+		return
+	}
+
+	groupID := generateGroupID()
+	Groups[groupID] = Group{
+		ID:      groupID,
+		Name:    body.Name,
+		Owner:   username,
+		Members: append(body.Members, username),
+	}
+
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(map[string]string{
+		"group_id": groupID,
+		"message":  "Group created successfully",
+	})
+
+}
+
+func SharePassword(
+	w http.ResponseWriter,
+	r *http.Request,
+) {
+	w.Header().Set("Content-Type", "application/json")
+
+	token := r.Header.Get("Authorization")
+	TokenInfo, ok := tokens[token]
+	if !ok || time.Now().After(TokenInfo.Expiry) {
+		delete(tokens, token)
+		w.WriteHeader(http.StatusUnauthorized)
+		json.NewEncoder(w).Encode(ErrorResponse{
+			Error: "Invalid or expried token",
+		})
+		return
+	}
+
+	sender := TokenInfo.Username
+
+	var body SharePasswordRequest
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.GroupID == "" || body.Name == "" {
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(ErrorResponse{
+			Error: "Invalid input",
+		})
+		return
+	}
+
+	group, ok := Groups[body.GroupID]
+	if !ok {
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(ErrorResponse{
+			Error: "Group not found",
+		})
+		return
+	}
+
+	member := false
+	for _, m := range group.Members {
+		if m == sender {
+			member = true
+			break
+		}
+	}
+
+	if !member {
+		w.WriteHeader(http.StatusUnauthorized)
+		json.NewEncoder(w).Encode(ErrorResponse{
+			Error: "You are not a member of this group",
+		})
+		return
+	}
+
+	password := body.Password
+	var err error
+	if password == "" {
+		password, err = generatPassword(16)
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(ErrorResponse{
+				Error: "Password generation failed",
+			})
+			return
+		}
+	}
+
+	key := loadEncryptionKey()
+	encryptedPassword, err := EncryptAES(password, key)
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(ErrorResponse{
+			Error: "Encryption failed",
+		})
+		return
+	}
+
+	id := body.GroupID + ":" + body.Name
+	SharedPasswords[id] = SharedPassword{
+		GroupID:  body.GroupID,
+		Name:     body.Name,
+		Owner:    sender,
+		Password: encryptedPassword,
+	}
+
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(map[string]string{
+		"message":  " Password Shared successfully",
+		"password": password,
+	})
+}
+
+func ListSharedPasswords(
+	w http.ResponseWriter,
+	r *http.Request,
+) {
+	w.Header().Set("Content-Type", "application/json")
+
+	token := r.Header.Get("Authorization")
+	TokenInfo, ok := tokens[token]
+	if !ok || time.Now().After(TokenInfo.Expiry) {
+		delete(tokens, token)
+		w.WriteHeader(http.StatusUnauthorized)
+		json.NewEncoder(w).Encode(ErrorResponse{
+			Error: "Invalid or expired token",
+		})
+		return
+	}
+
+	user := TokenInfo.Username
+	groupID := r.URL.Query().Get("group_id")
+	if groupID == "" {
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(ErrorResponse{
+			Error: "Group ID is required",
+		})
+		return
+	}
+
+	group, ok := Groups[groupID]
+	if !ok {
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(ErrorResponse{
+			Error: "Group not found",
+		})
+		return
+	}
+
+	member := false
+	for _, m := range group.Members {
+		if m == user {
+			member = true
+			break
+		}
+	}
+
+	if !member {
+		w.WriteHeader(http.StatusUnauthorized)
+		json.NewEncoder(w).Encode(ErrorResponse{
+			Error: "You are not a member of this group",
+		})
+		return
+	}
+
+	var response []SharedPassword
+
+	for _, sp := range SharedPasswords {
+		if sp.GroupID == groupID {
+			passCopy := sp
+			key := loadEncryptionKey()
+			decrypted, err := DecryptAES(sp.Password, key)
+			if err != nil {
+				w.WriteHeader(http.StatusInternalServerError)
+				return
+			}
+			passCopy.Password = decrypted
+			passCopy.Members = group.Members
+			response = append(response, passCopy)
+		}
+	}
+
+	w.WriteHeader(http.StatusOK)
+	encoder := json.NewEncoder(w)
+	encoder.SetIndent("", " ")
+	encoder.Encode(response)
 }

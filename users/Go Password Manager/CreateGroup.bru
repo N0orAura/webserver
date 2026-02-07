@@ -1,25 +1,25 @@
 meta {
-  name: Signup
+  name: CreateGroup
   type: http
-  seq: 2
+  seq: 9
 }
 
 post {
-  url: http://localhost:8080/sign_up
+  url: http://localhost:8080/create_group
   body: json
   auth: inherit
 }
 
 headers {
+  Authorization: {{TOKEN}}
   Content-Type: application/json
 }
 
 body:json {
   {
-    "username": "salma123",
-    "password": "salmaRS2016@VA"
+    "name" : "Spotify",
+    "members" : ["Habiba", "Noor", "Bahar"]
   }
-  
 }
 
 settings {
