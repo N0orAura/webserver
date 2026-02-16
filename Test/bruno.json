@@ -1,6 +1,6 @@
 {
   "version": "1",
-  "name": "Go Password Manager",
+  "name": "Test",
   "type": "collection",
   "ignore": [
     "node_modules",

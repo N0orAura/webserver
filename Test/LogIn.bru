@@ -1,7 +1,7 @@
 meta {
-  name: Login
+  name: LogIn
   type: http
-  seq: 3
+  seq: 2
 }
 
 post {
@@ -10,21 +10,19 @@ post {
   auth: inherit
 }
 
+params:query {
+  : 
+}
+
 headers {
   Content-Type: application/json
 }
 
 body:json {
   {
-    "username": "salma123",
-    "password": "salmaRS2016@VA"
+    "username": "testuser",
+    "password": "StrongPass!123"
   }
-}
-
-tests {
-  const data = res.body;
-  bru.setEnvVar("TOKEN", data.token);
-  
 }
 
 settings {

@@ -1,320 +1,196 @@
 package main
 
 import (
-	"crypto/aes"
-	"crypto/cipher"
-	"crypto/rand"
-	"encoding/base64"
+	cryptorand "crypto/rand"
 	"encoding/hex"
 	"encoding/json"
-	"io"
+	"fmt"
 	"net/http"
 	"os"
 	"strings"
 	"time"
 
+	"passwordmanager/models"
+
+	"github.com/google/uuid"
 	"github.com/joho/godotenv"
+	"github.com/labstack/echo/v4"
+	"github.com/labstack/echo/v4/middleware"
 	"golang.org/x/crypto/bcrypt"
 )
 
-func EncryptAES(plainText string, key []byte) (string, error) {
-	block, err := aes.NewCipher(key)
+var encryptionKey []byte
+
+func init() {
+
+	err := godotenv.Load(".env")
 	if err != nil {
-		return "", err
+		panic("Error loading .evn file")
 	}
 
-	gcm, err := cipher.NewGCM(block)
-	if err != nil {
-		return "", err
-	}
-
-	nonce := make([]byte, gcm.NonceSize())
-	if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
-		return "", err
-	}
-
-	cipherText := gcm.Seal(nonce, nonce, []byte(plainText), nil)
-	return base64.StdEncoding.EncodeToString(cipherText), nil
-}
-
-func DecryptAES(cipherText string, key []byte) (string, error) {
-	data, err := base64.StdEncoding.DecodeString(cipherText)
-	if err != nil {
-		return "", err
-	}
-
-	block, err := aes.NewCipher(key)
-	if err != nil {
-		return "", err
-	}
-
-	gcm, err := cipher.NewGCM(block)
-	if err != nil {
-		return "", err
-	}
-
-	nonceSize := gcm.NonceSize()
-	nonce, cipherData := data[:nonceSize], data[nonceSize:]
-
-	plainText, err := gcm.Open(nil, nonce, cipherData, nil)
-	if err != nil {
-		return "", err
-	}
-
-	return string(plainText), nil
-}
-
-func loadEncryptionKey() []byte {
 	key := os.Getenv("ENCRYPTION_KEY")
-
 	if key == "" {
 		panic("ENCRYPTION_KEY is missing")
 	}
-
 	if len(key) != 32 {
 		panic("ENCRYPTION_KEY must be 32 bytes long")
 	}
-	return []byte(key)
+	encryptionKey = []byte(key)
+}
+
+var users = map[string]models.User{}
+
+var LoginAttempts = map[string]models.LoginAttempt{}
+
+var tokens = map[string]models.TokenInfo{}
+
+func getEncryptionKey() []byte {
+	return encryptionKey
+}
+
+func generateAuthToken() string {
+	b := make([]byte, 32)
+	if _, err := cryptorand.Read(b); err != nil {
+		panic("failed to generate token")
+	}
+	return hex.EncodeToString(b)
+}
+
+func generatePassword(length int) (string, error) { // @NOTE: func name has a typo
+	const charset = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789!@#$%^&*()_+-"
+
+	if len(charset) > 256 {
+		return "", fmt.Errorf("charset too large")
+	}
+
+	randomBytes := make([]byte, length)
+
+	if _, err := cryptorand.Read(randomBytes); err != nil {
+		return "", err
+	}
+
+	result := make([]byte, length)
+	charsetLen := len(charset)
+
+	for i, randomByte := range randomBytes {
+		index := int(randomByte) % charsetLen
+		result[i] = charset[index]
+	}
+
+	return string(result), nil
+}
+
+func generateGroupID() string {
+	return uuid.NewString()
+}
+
+func sendJSON(
+	w http.ResponseWriter,
+	status int,
+	payload interface{}) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	json.NewEncoder(w).Encode(payload)
+}
+
+func decodeJSONBody(
+	r *http.Request,
+	dst interface{}) error {
+	decoder := json.NewDecoder(r.Body)
+	decoder.DisallowUnknownFields()
+	return decoder.Decode(dst)
+}
+
+func hasUppercase(s string) bool {
+	for _, ch := range s {
+		if ch >= 'A' && ch <= 'Z' {
+			return true
+		}
+	}
+	return false
+}
+
+func hasTooManyConsecutiveChars(s string) bool {
+	count := 0
+	for i := 1; i < len(s); i++ {
+		if s[i] == s[i-1] {
+			count++
+			if count >= 3 {
+				return true
+			}
+		} else {
+			count = 0
+		}
+	}
+	return false
+}
+
+func hasSymbol(s string) bool {
+	symbols := "!@#$%^&*()-+"
+	for _, c := range s {
+		if strings.ContainsRune(symbols, c) {
+			return true
+		}
+	}
+	return false
 }
 
 func main() {
 
-	err := godotenv.Load(".env")
-	if err != nil {
-		panic("Error loading .env file")
+	e := echo.New()
+
+	e.Use(middleware.Logger())
+	e.Use(middleware.Recover())
+
+	e.POST("/sign_up", SignUp)
+	e.POST("/log_in", Login)
+	e.POST("/add_password", AddPassword)
+	e.GET("/list_passwords", ListPasswords)
+	e.POST("/generate_password", GeneratePasswordHandler)
+
+	e.Logger.Fatal(e.Start(":8080"))
+}
+
+func SignUp(c echo.Context) error {
+	var body models.SignUpRequest
+
+	if err := c.Bind(&body); err != nil {
+		return c.JSON(400, models.ErrorResponse{Error: "Invalid input"})
 	}
 
-	http.HandleFunc("/sign_up", SignUp)
-	http.HandleFunc("/log_in", Login)
-	http.HandleFunc("/log_out", Logout)
-	http.HandleFunc("/add_password", AddPassword)
-	http.HandleFunc("/list_passwords", ListPasswords)
-	http.HandleFunc("/get_password", GetPassword)
-	http.HandleFunc("/search_passwords", SearchPasswords)
-	http.HandleFunc("/delete_password", DeletePassword)
-	http.HandleFunc("/create_group", CreateGroup)
-	http.HandleFunc("/share_password", SharePassword)
-	http.HandleFunc("/list_shared_passwords", ListSharedPasswords)
-	http.ListenAndServe(":8080", nil)
-}
-
-type ErrorResponse struct {
-	Error string `json:"error"`
-}
-
-type MessageResponse struct {
-	Message string `json:"message"`
-}
-
-type PasswordInfo struct {
-	Name     string `json:"name"`
-	Username string `json:"username"`
-	Password string `json:"password"`
-}
-type User struct {
-	Username  string
-	Password  string
-	Passwords []PasswordInfo
-}
-
-var users = map[string]User{}
-
-type TokenInfo struct {
-	Username string
-	Expiry   time.Time
-}
-
-type LoginAttempt struct {
-	Count     int
-	BlockedAt time.Time
-}
-
-var LoginAttempts = map[string]LoginAttempt{}
-
-var tokens = map[string]TokenInfo{}
-
-type SignUpRequest struct {
-	Username string `json:"username"`
-	Password string `json:"password"`
-}
-
-type LoginRequest struct {
-	Username string `json:"username"`
-	Password string `json:"password"`
-}
-
-type AddPasswordRequest struct {
-	Name     string `json:"name"`
-	Username string `json:"username"`
-	Password string `json:"password"`
-}
-
-type StoredPassword struct {
-	Username string `json:"username"`
-	Password string `json:"password"`
-}
-
-type CreateGroupRequest struct {
-	Name    string   `json:"name"`
-	Members []string `json:"members"`
-}
-
-type Group struct {
-	ID      string   `json:"id"`
-	Name    string   `json:"name"`
-	Owner   string   `json:"owner"`
-	Members []string `json:"members"`
-}
-
-type SharedPassword struct {
-	Name     string   `json:"name"`
-	Password string   `json:"password"`
-	Owner    string   `json:"owner"`
-	GroupID  string   `json:"group_id"`
-	Members  []string `json:"members"`
-}
-
-var Groups = map[string]Group{}
-var SharedPasswords = map[string]SharedPassword{}
-
-type SharePasswordRequest struct {
-	GroupID  string `json:"group_id"`
-	Name     string `json:"name"`
-	Username string `json:"username"`
-	Password string `json:"password"`
-}
-
-func generateToken() string {
-	b := make([]byte, 32)
-	rand.Read(b)
-	return hex.EncodeToString(b)
-}
-
-func generatPassword(length int) (string, error) {
-	const charset = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789!@#$%^&*()_+-"
-	b := make([]byte, length)
-	_, err := rand.Read(b)
-	if err != nil {
-		return "", err
-	}
-
-	for i := 0; i < length; i++ {
-		b[i] = charset[int(b[i])%len(charset)]
-	}
-
-	return string(b), nil
-}
-
-func generateGroupID() string {
-	b := make([]byte, 16)
-	rand.Read(b)
-	return hex.EncodeToString(b)
-}
-
-func SignUp(
-	w http.ResponseWriter,
-	r *http.Request,
-) {
-	w.Header().Set("Content-Type", "application/json")
-
-	var body SignUpRequest
-
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		w.WriteHeader(http.StatusBadRequest)
-		json.NewEncoder(w).Encode(ErrorResponse{
-			Error: "invalid input",
-		})
-		return
-	}
-	username := body.Username
-	password := body.Password
+	username := strings.ToLower(strings.TrimSpace(body.Username))
+	password := strings.TrimSpace(body.Password)
 
 	if username == "" || password == "" {
-		w.WriteHeader(http.StatusBadRequest)
-		json.NewEncoder(w).Encode(ErrorResponse{
-			Error: "invalid input",
-		})
-		return
+		return c.JSON(400, models.ErrorResponse{Error: "Username and password required"})
 	}
 
 	if len(username) < 6 {
-		w.WriteHeader(http.StatusBadRequest)
-		json.NewEncoder(w).Encode(ErrorResponse{
-			Error: "username must be at least 6 characters long",
-		})
-		return
+		return c.JSON(400, models.ErrorResponse{Error: "Username must be at least 6 characters long"})
 	}
 
 	if _, exists := users[username]; exists {
-		w.WriteHeader(http.StatusBadRequest)
-		json.NewEncoder(w).Encode(ErrorResponse{
-			Error: "User already exists",
-		})
-		return
+		return c.JSON(400, models.ErrorResponse{Error: "User already exists"})
 	}
 
 	if len(password) < 12 {
-		w.WriteHeader(http.StatusBadRequest)
-		json.NewEncoder(w).Encode(ErrorResponse{
-			Error: "password must be at least 12 characters long",
-		})
-		return
+		return c.JSON(400, models.ErrorResponse{Error: "Password must be at least 12 characters long"})
 	}
 
-	hasCapital := false
-	for _, ch := range password {
-		if ch >= 'A' && ch <= 'Z' {
-			hasCapital = true
-			break
-		}
+	if !hasUppercase(password) {
+		return c.JSON(400, models.ErrorResponse{Error: "Password must contain at least one uppercase letter"})
 	}
 
-	if !hasCapital {
-		w.WriteHeader(http.StatusBadRequest)
-		json.NewEncoder(w).Encode(ErrorResponse{
-			Error: "must contain capital letter",
-		})
-		return
-	}
-	sameCount := 0
-	for i := 1; i < len(password); i++ {
-		if password[i] == password[i-1] {
-			sameCount++
-			if sameCount >= 3 {
-				w.WriteHeader(http.StatusBadRequest)
-				json.NewEncoder(w).Encode(ErrorResponse{
-					Error: "cannot have more than 3 consecutive identical characters",
-				})
-				return
-			}
-		} else {
-			sameCount = 0
-		}
+	if hasTooManyConsecutiveChars(password) {
+		return c.JSON(400, models.ErrorResponse{Error: "Password cannot have more than 3 consecutive identical characters"})
 	}
 
-	symbols := "!@#$%^&*()-+"
-	hasSymbol := false
-	for _, c := range password {
-		if strings.ContainsRune(symbols, c) {
-			hasSymbol = true
-			break
-		}
-	}
-
-	if !hasSymbol {
-		w.WriteHeader(http.StatusBadRequest)
-		json.NewEncoder(w).Encode(ErrorResponse{
-			Error: "must contain special character",
-		})
-		return
+	if !hasSymbol(password) {
+		return c.JSON(400, models.ErrorResponse{Error: "Password must contain a special character"})
 	}
 
 	if strings.Contains(strings.ToLower(password), strings.ToLower(username)) {
-		w.WriteHeader(http.StatusBadRequest)
-		json.NewEncoder(w).Encode(ErrorResponse{
-			Error: "password must not contain username",
-		})
-		return
+		return c.JSON(400, models.ErrorResponse{Error: "Password must not contain username"})
 	}
 
 	hashedPassword, err := bcrypt.GenerateFromPassword(
@@ -322,650 +198,186 @@ func SignUp(
 		bcrypt.DefaultCost,
 	)
 	if err != nil {
-		w.WriteHeader(http.StatusInternalServerError)
-		json.NewEncoder(w).Encode(ErrorResponse{
-			Error: "Error hashing password",
-		})
-		return
+		return c.JSON(500, models.ErrorResponse{Error: "Error hashing password"})
 	}
 
-	users[username] = User{
+	users[username] = models.User{
 		Username:  username,
 		Password:  string(hashedPassword),
-		Passwords: []PasswordInfo{},
+		Passwords: []models.PasswordInfo{},
 	}
 
-	w.WriteHeader(http.StatusCreated)
-	json.NewEncoder(w).Encode(MessageResponse{
-		Message: "Registration successful",
-	})
+	return c.JSON(201, models.MessageResponse{Message: "Registration successful"})
 }
 
-func Login(
-	w http.ResponseWriter,
-	r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
+func Login(c echo.Context) error {
 
-	var body LoginRequest
+	var body models.LoginRequest
 
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		w.WriteHeader(http.StatusBadRequest)
-		json.NewEncoder(w).Encode(ErrorResponse{
-			Error: "invalid input",
-		})
-		return
+	if err := c.Bind(&body); err != nil {
+		return c.JSON(400, models.ErrorResponse{Error: "invalid input"})
 	}
 
-	username := body.Username
-	password := body.Password
+	username := strings.ToLower(strings.TrimSpace(body.Username))
+	password := strings.TrimSpace(body.Password)
 
-	attempt, exists := LoginAttempts[username]
-	if exists && attempt.Count >= 5 {
-		if time.Since(attempt.BlockedAt) < 15*time.Minute {
-			w.WriteHeader(http.StatusTooManyRequests)
-			json.NewEncoder(w).Encode(ErrorResponse{
-				Error: "Too many failed login attempts. PLease try again after 15 minute",
-			})
-			return
+	if username == "" || password == "" {
+		return c.JSON(400, models.ErrorResponse{Error: "username and password required"})
+	}
+
+	attempt := LoginAttempts[username]
+
+	if attempt.Count >= 5 {
+		waitMinutes := 15 - int(time.Since(attempt.BlockedAt).Minutes())
+		if waitMinutes > 0 {
+			return c.JSON(429, models.ErrorResponse{Error: fmt.Sprintf("Too many failed login attempts. Please try again after %d minute(s)", waitMinutes)})
 		}
-		delete(LoginAttempts, username)
+		attempt = models.LoginAttempt{}
+		LoginAttempts[username] = attempt
 	}
 
-	user, ok := users[username]
-	if !ok {
+	user, exists := users[username]
+	if !exists {
 		attempt.Count++
 		if attempt.Count >= 5 {
 			attempt.BlockedAt = time.Now()
 		}
 		LoginAttempts[username] = attempt
-		w.WriteHeader(http.StatusUnauthorized)
-		json.NewEncoder(w).Encode(MessageResponse{
-			Message: "Invalid Username or Password",
-		})
-		return
+		return c.JSON(401, models.MessageResponse{Message: "Invalid Username or Password"})
 	}
 
-	err := bcrypt.CompareHashAndPassword(
-		[]byte(user.Password),
-		[]byte(password),
-	)
-	if err != nil {
+	if err := bcrypt.CompareHashAndPassword([]byte(user.Password), []byte(password)); err != nil {
 		attempt.Count++
 		if attempt.Count >= 5 {
 			attempt.BlockedAt = time.Now()
 		}
 		LoginAttempts[username] = attempt
-		w.WriteHeader(http.StatusUnauthorized)
-		json.NewEncoder(w).Encode(MessageResponse{
-			Message: "Invalid Username or Password",
-		})
-		return
+		return c.JSON(http.StatusUnauthorized, models.MessageResponse{Message: "Invalid Username or Password"})
 	}
-
+	//what about this??//
 	delete(LoginAttempts, username)
 
-	token := generateToken()
-	tokens[token] = TokenInfo{
+	token := generateAuthToken()
+	expiry := time.Now().Add(24 * time.Hour)
+	tokens[token] = models.TokenInfo{
 		Username: username,
-		Expiry:   time.Now().Add(24 * time.Hour),
+		Expiry:   expiry,
 	}
-	w.WriteHeader(http.StatusOK)
 
-	json.NewEncoder(w).Encode(map[string]string{
-		"token": token,
+	return c.JSON(200, models.LoginResponse{
+		Token:  token,
+		Expiry: expiry,
 	})
 }
 
-func Logout(
-	w http.ResponseWriter,
-	r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
+func AddPassword(c echo.Context) error {
 
-	token := r.Header.Get("Authorization")
-	delete(tokens, token)
+	var body models.AddPasswordRequest
 
-	w.WriteHeader(http.StatusOK)
-	json.NewEncoder(w).Encode(MessageResponse{
-		Message: "Logged out successfully",
-	})
-}
+	if err := c.Bind(&body); err != nil {
+		return c.JSON(400, models.ErrorResponse{Error: "invalid input"})
 
-func AddPassword(
-	w http.ResponseWriter,
-	r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
-
-	var body AddPasswordRequest
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		w.WriteHeader(http.StatusBadRequest)
-		json.NewEncoder(w).Encode(ErrorResponse{
-			Error: "invalid input",
-		})
-		return
 	}
 
-	token := r.Header.Get("Authorization")
-	TokenInfo, ok := tokens[token]
-	if !ok || time.Now().After(TokenInfo.Expiry) {
-		delete(tokens, token)
-		w.WriteHeader(http.StatusUnauthorized)
-		json.NewEncoder(w).Encode(ErrorResponse{
-			Error: "Invalid or expired token",
+	if strings.TrimSpace(body.Name) == "" {
+		return c.JSON(400, models.ErrorResponse{
+			Error: "Name is required",
 		})
-		return
 	}
-	username := TokenInfo.Username
+
+	token := c.Request().Header.Get("Authorization")
+	tokenInfo, ok := ValidateToken(token)
+	if !ok {
+		return c.JSON(401, models.ErrorResponse{Error: "Invalid or expired token"})
+	}
+
+	username := tokenInfo.Username
 	user, ok := users[username]
 	if !ok {
-		w.WriteHeader(http.StatusUnauthorized)
-		json.NewEncoder(w).Encode(ErrorResponse{
-			Error: "User not found",
-		})
-		return
+		return c.JSON(400, models.ErrorResponse{Error: "User not found"})
 	}
 
 	password := body.Password
 
 	if password == "" {
 		var err error
-		password, err = generatPassword(16)
+		password, err = generatePassword(16)
 		if err != nil {
-			w.WriteHeader(http.StatusBadRequest)
-			json.NewEncoder(w).Encode(ErrorResponse{
-				Error: "Password generation failed",
-			})
-			return
+			return c.JSON(400, models.ErrorResponse{Error: "Password generation failed"})
 		}
 	}
 
-	if len(password) < 12 {
-		w.WriteHeader(http.StatusBadRequest)
-		json.NewEncoder(w).Encode(ErrorResponse{
-			Error: "password must be at least 12 characters long",
-		})
-		return
-	}
-
-	hasCapital := false
-	for _, ch := range password {
-		if ch >= 'A' && ch <= 'Z' {
-			hasCapital = true
-			break
-		}
-	}
-
-	if !hasCapital {
-		w.WriteHeader(http.StatusBadRequest)
-		json.NewEncoder(w).Encode(ErrorResponse{
-			Error: "must contain capital letter",
-		})
-		return
-	}
-
-	sameCount := 0
-	for i := 1; i < len(password); i++ {
-		if password[i] == password[i-1] {
-			sameCount++
-			if sameCount >= 3 {
-				w.WriteHeader(http.StatusBadRequest)
-				json.NewEncoder(w).Encode(ErrorResponse{
-					Error: "cannot have more than 3 consecutive identical characters",
-				})
-				return
-			}
-		} else {
-			sameCount = 0
-		}
-	}
-
-	symbols := "!@#$%^&*()-+"
-	hasSymbol := false
-	for _, c := range password {
-		if strings.ContainsRune(symbols, c) {
-			hasSymbol = true
-			break
-		}
-	}
-
-	if !hasSymbol {
-		w.WriteHeader(http.StatusBadRequest)
-		json.NewEncoder(w).Encode(ErrorResponse{
-			Error: "must contain special character",
-		})
-		return
-	}
-
-	if strings.Contains(strings.ToLower(password), strings.ToLower(username)) {
-		w.WriteHeader(http.StatusBadRequest)
-		json.NewEncoder(w).Encode(ErrorResponse{
-			Error: "password must not contain username",
-		})
-		return
-	}
-
-	key := loadEncryptionKey()
+	key := getEncryptionKey()
 	encryptedPassword, err := EncryptAES(password, key)
 	if err != nil {
-		w.WriteHeader(http.StatusInternalServerError)
-		json.NewEncoder(w).Encode(ErrorResponse{
-			Error: "Encryption failed",
-		})
-		return
+		return c.JSON(400, models.ErrorResponse{Error: "Encryption failed"})
 	}
 
-	pass := PasswordInfo{
+	pass := models.PasswordInfo{
 		Name:     body.Name,
 		Username: body.Username,
 		Password: encryptedPassword,
 	}
 
-	found := false
-	for i, p := range user.Passwords {
-		if p.Name == body.Name {
-			user.Passwords[i] = pass
-			found = true
-			break
-		}
-	}
-
-	if !found {
-		user.Passwords = append(user.Passwords, pass)
-	}
-
+	user.Passwords = append(user.Passwords, pass)
 	users[username] = user
-	w.WriteHeader(http.StatusOK)
-	json.NewEncoder(w).Encode(MessageResponse{
-		Message: "Password Saved",
-	})
+
+	return c.JSON(200, models.MessageResponse{Message: "Password Saved"})
 }
 
-func ListPasswords(
-	w http.ResponseWriter,
-	r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
-
-	token := r.Header.Get("Authorization")
-	TokenInfo, ok := tokens[token]
-	if !ok || time.Now().After(TokenInfo.Expiry) {
+func ValidateToken(token string) (models.TokenInfo, bool) {
+	t, ok := tokens[token]
+	if !ok || time.Now().After(t.Expiry) {
 		delete(tokens, token)
-		w.WriteHeader(http.StatusUnauthorized)
-		json.NewEncoder(w).Encode(ErrorResponse{
-			Error: "Invalid or expired token",
-		})
-		return
+		return models.TokenInfo{}, false
+	}
+	return t, true
+}
 
+func ListPasswords(c echo.Context) error {
+
+	token := c.Request().Header.Get("Authorization")
+	tokenInfo, ok := ValidateToken(token)
+	if !ok {
+		return c.JSON(401, models.ErrorResponse{Error: "Invalid or expired token"})
 	}
 
-	username := TokenInfo.Username
-	user := users[username]
+	user, exists := users[tokenInfo.Username]
+	if !exists {
+		return c.JSON(400, models.ErrorResponse{Error: "User not found"})
+	}
 
-	passwords := user.Passwords
-	var response []PasswordInfo
+	key := getEncryptionKey()
 
-	for _, pass := range passwords {
-		passCopy := pass
-		key := loadEncryptionKey()
+	passwords := make([]models.PasswordInfo, 0, len(user.Passwords))
+	for _, pass := range user.Passwords {
 		decrypted, err := DecryptAES(pass.Password, key)
 		if err != nil {
-			w.WriteHeader(http.StatusInternalServerError)
-			return
+			return c.JSON(500, models.ErrorResponse{Error: "Failed to decrypt passwords"})
 		}
+		passCopy := pass
 		passCopy.Password = decrypted
-		response = append(response, passCopy)
+		passwords = append(passwords, passCopy)
 	}
 
-	w.WriteHeader(http.StatusOK)
-	json.NewEncoder(w).Encode(user.Passwords)
+	response := models.ListPasswordsResponse{
+		Passwords: passwords,
+		Count:     len(passwords),
+	}
+
+	return c.JSON(200, response)
 }
 
-func GetPassword(
-	w http.ResponseWriter,
-	r *http.Request) {
+func GeneratePasswordHandler(c echo.Context) error {
+	length := 16
 
-	token := r.Header.Get("Authorization")
-	TokenInfo, ok := tokens[token]
-	if !ok || time.Now().After(TokenInfo.Expiry) {
-		delete(tokens, token)
-		w.WriteHeader(http.StatusUnauthorized)
-		json.NewEncoder(w).Encode(ErrorResponse{
-			Error: "Invalid or expired token",
-		})
-		return
-	}
-
-	name := r.URL.Query().Get("name")
-	if name == "" {
-		w.WriteHeader(http.StatusBadRequest)
-		json.NewEncoder(w).Encode(ErrorResponse{
-			Error: "Password name is required",
-		})
-		return
-	}
-
-	user := users[TokenInfo.Username]
-	for _, pass := range user.Passwords {
-		if pass.Name == name {
-			passCopy := pass
-			key := loadEncryptionKey()
-			decrypted, err := DecryptAES(pass.Password, key)
-			if err != nil {
-				w.WriteHeader(http.StatusInternalServerError)
-				return
-			}
-			passCopy.Password = decrypted
-			w.WriteHeader(http.StatusOK)
-			encoder := json.NewEncoder(w)
-			encoder.SetIndent("", " ")
-			encoder.Encode(passCopy)
-			return
-		}
-	}
-
-	w.WriteHeader(http.StatusNotFound)
-	json.NewEncoder(w).Encode(ErrorResponse{
-		Error: "Password not found",
-	})
-}
-
-func SearchPasswords(
-	w http.ResponseWriter,
-	r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
-
-	token := r.Header.Get("Authorization")
-	TokenInfo, ok := tokens[token]
-	if !ok || time.Now().After(TokenInfo.Expiry) {
-		delete(tokens, token)
-		w.WriteHeader(http.StatusUnauthorized)
-		json.NewEncoder(w).Encode(ErrorResponse{
-			Error: "Invalid or expired token",
-		})
-		return
-	}
-
-	query := r.URL.Query().Get("query")
-	if query == "" {
-		w.WriteHeader(http.StatusBadRequest)
-		json.NewEncoder(w).Encode(ErrorResponse{
-			Error: "Search query is required",
-		})
-		return
-	}
-
-	user := users[TokenInfo.Username]
-	var results []PasswordInfo
-	for _, pass := range user.Passwords {
-		if strings.Contains(pass.Name, query) {
-			passCopy := pass
-			key := loadEncryptionKey()
-			decrypted, err := DecryptAES(pass.Password, key)
-			if err != nil {
-				w.WriteHeader(http.StatusInternalServerError)
-				return
-			}
-			passCopy.Password = decrypted
-			results = append(results, passCopy)
-		}
-	}
-
-	w.WriteHeader(http.StatusOK)
-	json.NewEncoder(w).Encode(results)
-}
-
-func DeletePassword(
-	w http.ResponseWriter,
-	r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
-
-	token := r.Header.Get("Authorization")
-	TokenInfo, ok := tokens[token]
-	if !ok || time.Now().After(TokenInfo.Expiry) {
-		delete(tokens, token)
-		w.WriteHeader(http.StatusUnauthorized)
-		json.NewEncoder(w).Encode(ErrorResponse{
-			Error: "Invalid or expired token",
-		})
-		return
-	}
-
-	name := r.URL.Query().Get("name")
-	if name == "" {
-		w.WriteHeader(http.StatusBadRequest)
-		json.NewEncoder(w).Encode(ErrorResponse{
-			Error: "Password name is required",
-		})
-		return
-	}
-
-	username := TokenInfo.Username
-	user := users[username]
-
-	for i, pass := range user.Passwords {
-		if pass.Name == name {
-			user.Passwords = append(
-				user.Passwords[:i],
-				user.Passwords[i+1:]...,
-			)
-			users[username] = user
-			w.WriteHeader(http.StatusOK)
-			json.NewEncoder(w).Encode(MessageResponse{
-				Message: "Password deleted",
-			})
-			return
-		}
-	}
-
-	w.WriteHeader(http.StatusNotFound)
-	json.NewEncoder(w).Encode(ErrorResponse{
-		Error: "Password not found",
-	})
-}
-
-func CreateGroup(
-	w http.ResponseWriter,
-	r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
-
-	token := r.Header.Get("Authorization")
-	TokenInfo, ok := tokens[token]
-	if !ok || time.Now().After(TokenInfo.Expiry) {
-		delete(tokens, token)
-		w.WriteHeader(http.StatusUnauthorized)
-		json.NewEncoder(w).Encode(ErrorResponse{
-			Error: "Invalid or expired token",
-		})
-		return
-	}
-
-	username := TokenInfo.Username
-
-	var body CreateGroupRequest
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		w.WriteHeader(http.StatusBadRequest)
-		json.NewEncoder(w).Encode(ErrorResponse{
-			Error: "Invalid input",
-		})
-		return
-	}
-
-	groupID := generateGroupID()
-	Groups[groupID] = Group{
-		ID:      groupID,
-		Name:    body.Name,
-		Owner:   username,
-		Members: append(body.Members, username),
-	}
-
-	w.WriteHeader(http.StatusOK)
-	json.NewEncoder(w).Encode(map[string]string{
-		"group_id": groupID,
-		"message":  "Group created successfully",
-	})
-
-}
-
-func SharePassword(
-	w http.ResponseWriter,
-	r *http.Request,
-) {
-	w.Header().Set("Content-Type", "application/json")
-
-	token := r.Header.Get("Authorization")
-	TokenInfo, ok := tokens[token]
-	if !ok || time.Now().After(TokenInfo.Expiry) {
-		delete(tokens, token)
-		w.WriteHeader(http.StatusUnauthorized)
-		json.NewEncoder(w).Encode(ErrorResponse{
-			Error: "Invalid or expried token",
-		})
-		return
-	}
-
-	sender := TokenInfo.Username
-
-	var body SharePasswordRequest
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.GroupID == "" || body.Name == "" {
-		w.WriteHeader(http.StatusBadRequest)
-		json.NewEncoder(w).Encode(ErrorResponse{
-			Error: "Invalid input",
-		})
-		return
-	}
-
-	group, ok := Groups[body.GroupID]
-	if !ok {
-		w.WriteHeader(http.StatusBadRequest)
-		json.NewEncoder(w).Encode(ErrorResponse{
-			Error: "Group not found",
-		})
-		return
-	}
-
-	member := false
-	for _, m := range group.Members {
-		if m == sender {
-			member = true
-			break
-		}
-	}
-
-	if !member {
-		w.WriteHeader(http.StatusUnauthorized)
-		json.NewEncoder(w).Encode(ErrorResponse{
-			Error: "You are not a member of this group",
-		})
-		return
-	}
-
-	password := body.Password
-	var err error
-	if password == "" {
-		password, err = generatPassword(16)
-		if err != nil {
-			w.WriteHeader(http.StatusInternalServerError)
-			json.NewEncoder(w).Encode(ErrorResponse{
-				Error: "Password generation failed",
-			})
-			return
-		}
-	}
-
-	key := loadEncryptionKey()
-	encryptedPassword, err := EncryptAES(password, key)
+	pass, err := generatePassword(length)
 	if err != nil {
-		w.WriteHeader(http.StatusInternalServerError)
-		json.NewEncoder(w).Encode(ErrorResponse{
-			Error: "Encryption failed",
+		return c.JSON(500, models.ErrorResponse{
+			Error: "Password generation failed",
 		})
-		return
 	}
-
-	id := body.GroupID + ":" + body.Name
-	SharedPasswords[id] = SharedPassword{
-		GroupID:  body.GroupID,
-		Name:     body.Name,
-		Owner:    sender,
-		Password: encryptedPassword,
-	}
-
-	w.WriteHeader(http.StatusOK)
-	json.NewEncoder(w).Encode(map[string]string{
-		"message":  " Password Shared successfully",
-		"password": password,
+	return c.JSON(200, map[string]string{
+		"password": pass,
 	})
-}
-
-func ListSharedPasswords(
-	w http.ResponseWriter,
-	r *http.Request,
-) {
-	w.Header().Set("Content-Type", "application/json")
-
-	token := r.Header.Get("Authorization")
-	TokenInfo, ok := tokens[token]
-	if !ok || time.Now().After(TokenInfo.Expiry) {
-		delete(tokens, token)
-		w.WriteHeader(http.StatusUnauthorized)
-		json.NewEncoder(w).Encode(ErrorResponse{
-			Error: "Invalid or expired token",
-		})
-		return
-	}
-
-	user := TokenInfo.Username
-	groupID := r.URL.Query().Get("group_id")
-	if groupID == "" {
-		w.WriteHeader(http.StatusBadRequest)
-		json.NewEncoder(w).Encode(ErrorResponse{
-			Error: "Group ID is required",
-		})
-		return
-	}
-
-	group, ok := Groups[groupID]
-	if !ok {
-		w.WriteHeader(http.StatusBadRequest)
-		json.NewEncoder(w).Encode(ErrorResponse{
-			Error: "Group not found",
-		})
-		return
-	}
-
-	member := false
-	for _, m := range group.Members {
-		if m == user {
-			member = true
-			break
-		}
-	}
-
-	if !member {
-		w.WriteHeader(http.StatusUnauthorized)
-		json.NewEncoder(w).Encode(ErrorResponse{
-			Error: "You are not a member of this group",
-		})
-		return
-	}
-
-	var response []SharedPassword
-
-	for _, sp := range SharedPasswords {
-		if sp.GroupID == groupID {
-			passCopy := sp
-			key := loadEncryptionKey()
-			decrypted, err := DecryptAES(sp.Password, key)
-			if err != nil {
-				w.WriteHeader(http.StatusInternalServerError)
-				return
-			}
-			passCopy.Password = decrypted
-			passCopy.Members = group.Members
-			response = append(response, passCopy)
-		}
-	}
-
-	w.WriteHeader(http.StatusOK)
-	encoder := json.NewEncoder(w)
-	encoder.SetIndent("", " ")
-	encoder.Encode(response)
 }
