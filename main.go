@@ -135,6 +135,14 @@ func hasSymbol(s string) bool {
 	return false
 }
 
+func extractToken(authHeader string) (string, bool) {
+	if authHeader == "" {
+		return "", false
+	}
+
+	return authHeader, true
+}
+
 func main() {
 
 	e := echo.New()
@@ -142,8 +150,12 @@ func main() {
 	e.Use(middleware.Logger())
 	e.Use(middleware.Recover())
 
+	loginLimiter := middleware.RateLimiter(
+		middleware.NewRateLimiterMemoryStore(5),
+	)
+
 	e.POST("/sign_up", SignUp)
-	e.POST("/log_in", Login)
+	e.POST("/log_in", Login, loginLimiter)
 	e.POST("/add_password", AddPassword)
 	e.GET("/list_passwords", ListPasswords)
 	e.POST("/generate_password", GeneratePasswordHandler)
@@ -160,6 +172,16 @@ func SignUp(c echo.Context) error {
 
 	username := strings.ToLower(strings.TrimSpace(body.Username))
 	password := strings.TrimSpace(body.Password)
+
+	generated := ""
+	if password == "" {
+		var err error
+		generated, err = generatePassword(16)
+		if err != nil {
+			return c.JSON(500, models.ErrorResponse{Error: "Password generation failed"})
+		}
+		password = generated
+	}
 
 	if username == "" || password == "" {
 		return c.JSON(400, models.ErrorResponse{Error: "Username and password required"})
@@ -205,6 +227,13 @@ func SignUp(c echo.Context) error {
 		Username:  username,
 		Password:  string(hashedPassword),
 		Passwords: []models.PasswordInfo{},
+	}
+
+	if generated != "" {
+		return c.JSON(201, map[string]string{
+			"message":            "Registration successful",
+			"generated_password": generated,
+		})
 	}
 
 	return c.JSON(201, models.MessageResponse{Message: "Registration successful"})
@@ -254,7 +283,7 @@ func Login(c echo.Context) error {
 		LoginAttempts[username] = attempt
 		return c.JSON(http.StatusUnauthorized, models.MessageResponse{Message: "Invalid Username or Password"})
 	}
-	//what about this??//
+
 	delete(LoginAttempts, username)
 
 	token := generateAuthToken()
@@ -285,7 +314,13 @@ func AddPassword(c echo.Context) error {
 		})
 	}
 
-	token := c.Request().Header.Get("Authorization")
+	authHeader := c.Request().Header.Get("Authorization")
+	token, ok := extractToken(authHeader)
+
+	if !ok {
+		return c.JSON(401, models.ErrorResponse{Error: "Invalid or expired token"})
+	}
+
 	tokenInfo, ok := ValidateToken(token)
 	if !ok {
 		return c.JSON(401, models.ErrorResponse{Error: "Invalid or expired token"})
@@ -336,7 +371,11 @@ func ValidateToken(token string) (models.TokenInfo, bool) {
 
 func ListPasswords(c echo.Context) error {
 
-	token := c.Request().Header.Get("Authorization")
+	authHeader := c.Request().Header.Get("Authorization")
+	token, ok := extractToken(authHeader)
+	if !ok {
+		return c.JSON(401, models.ErrorResponse{Error: "Invalid or expired token"})
+	}
 	tokenInfo, ok := ValidateToken(token)
 	if !ok {
 		return c.JSON(401, models.ErrorResponse{Error: "Invalid or expired token"})

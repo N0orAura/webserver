@@ -41,8 +41,9 @@ type LoginResponse struct {
 }
 
 type SignUpRequest struct {
-	Username string `json:"username"`
-	Password string `json:"password"`
+	Username         string `json:"username"`
+	Password         string `json:"password"`
+	GeneratePassword bool   `json:"generate_password"`
 }
 
 type LoginRequest struct {
